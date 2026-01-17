@@ -1,0 +1,32 @@
+{
+  "dataset": {
+    "repo_id": "piper_red_block",
+    "root": "/mnt/d/trial/lerobot/dataset/session_20260116_163348"
+  },
+  "policy": {
+    "type": "act",
+    "device": "cuda",
+    "chunk_size": 30,
+    "n_action_steps": 30,
+    "kl_weight": 10.0,
+    "temporal_ensemble_coeff": null,
+    "optimizer_lr": 5e-5,
+    "optimizer_lr_backbone": 5e-5,
+    "use_separate_backbone_per_camera": true,
+    "push_to_hub": false
+  },
+  "output_dir": "outputs/train/act_piper_red_block",
+  "job_name": "act_piper_red_block",
+  "batch_size": 64,
+  "steps": 8000,
+  "save_freq": 1000,
+  "save_checkpoint": true,
+  "log_freq": 100,
+  "eval_freq": 2000,
+  "seed": 1000,
+  "num_workers": 4,
+  "wandb": {
+    "enable": false
+  }
+}
+

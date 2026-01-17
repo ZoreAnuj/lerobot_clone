@@ -1,0 +1,81 @@
+{
+  "codebase_version": "v3.0",
+  "robot_type": "unknown",
+  "total_episodes": 300,
+  "total_frames": 163813,
+  "total_tasks": 1,
+  "total_videos": 600,
+  "total_chunks": 3,
+  "chunks_size": 100,
+  "fps": 30,
+  "splits": { "train": "0:300", "val": "0:0", "test": "0:0" },
+  "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+  "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+  "features": {
+    "episode_index": {
+      "dtype": "int64",
+      "shape": [1],
+      "names": null
+    },
+    "frame_index": {
+      "dtype": "int64",
+      "shape": [1],
+      "names": null
+    },
+    "index": {
+      "dtype": "int64",
+      "shape": [1],
+      "names": null
+    },
+    "timestamp": {
+      "dtype": "float32",
+      "shape": [1],
+      "names": null
+    },
+    "task_index": {
+      "dtype": "int64",
+      "shape": [1],
+      "names": null
+    },
+    "action": {
+      "dtype": "float32",
+      "shape": [7],
+      "names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "gripper"]
+    },
+    "observation.state": {
+      "dtype": "float32",
+      "shape": [7],
+      "names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "gripper"]
+    },
+    "observation.images.CameraLeft": {
+      "dtype": "video",
+      "shape": [480, 640, 3],
+      "names": ["height", "width", "channels"],
+      "info": {
+        "video.fps": 30,
+        "video.height": 480,
+        "video.width": 640,
+        "video.channels": 3,
+        "video.codec": "h264",
+        "video.pix_fmt": "yuv420p",
+        "video.is_depth_map": false,
+        "has_audio": false
+      }
+    },
+    "observation.images.CameraGripper": {
+      "dtype": "video",
+      "shape": [480, 640, 3],
+      "names": ["height", "width", "channels"],
+      "info": {
+        "video.fps": 30,
+        "video.height": 480,
+        "video.width": 640,
+        "video.channels": 3,
+        "video.codec": "h264",
+        "video.pix_fmt": "yuv420p",
+        "video.is_depth_map": false,
+        "has_audio": false
+      }
+    }
+  }
+}

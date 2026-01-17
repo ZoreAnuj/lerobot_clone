@@ -108,6 +108,8 @@ class ACTConfig(PreTrainedConfig):
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
+    # Use separate backbone for each camera (recommended for multi-camera setups)
+    separate_backbones_per_camera: bool = False
     # Transformer layers.
     pre_norm: bool = False
     dim_model: int = 512
