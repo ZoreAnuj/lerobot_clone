@@ -66,6 +66,8 @@ class DiffusionConfig(PreTrainedConfig):
         vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
         crop_shape: (H, W) shape to crop images to as a preprocessing step for the vision backbone. Must fit
             within the image size. If None, no cropping is done.
+        crop_fraction: If `crop_shape` is None and images are used, an adaptive crop is computed as
+            `(crop_fraction * H, crop_fraction * W)` rounded down to a multiple of `crop_round_to`.
         crop_is_random: Whether the crop should be random at training time (it's always a center crop in eval
             mode).
         pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
@@ -123,10 +125,20 @@ class DiffusionConfig(PreTrainedConfig):
     # Architecture / modeling.
     # Vision backbone.
     vision_backbone: str = "resnet18"
-    crop_shape: tuple[int, int] | None = (84, 84)
+    # New default: adaptive crop derived from the actual image stream resolution.
+    # Previous default (for reference): (84, 84)
+    crop_shape: tuple[int, int] | None = None
+    # New default: keep ~90% of the image dimensions to avoid cropping out small objects (e.g. 240x320 -> 216x288).
+    # Previous behavior (for reference): fixed 84x84 crop tuned for small images (e.g. PushT-like setups).
+    crop_fraction: float | None = 0.9
+    crop_round_to: int = 8
     crop_is_random: bool = True
-    pretrained_backbone_weights: str | None = None
-    use_group_norm: bool = True
+    # New default: light pretrained backbone for better visual features / generalization.
+    # Previous default (for reference): None
+    pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
+    # Note: DiffusionRgbEncoder disallows replacing BatchNorm with GroupNorm when using pretrained weights.
+    # Previous default (for reference): True
+    use_group_norm: bool = False
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
     # Unet.
@@ -207,15 +219,6 @@ class DiffusionConfig(PreTrainedConfig):
         if len(self.image_features) == 0 and self.env_state_feature is None:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
 
-        if self.crop_shape is not None:
-            for key, image_ft in self.image_features.items():
-                if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
-                    raise ValueError(
-                        f"`crop_shape` should fit within the images shapes. Got {self.crop_shape} "
-                        f"for `crop_shape` and {image_ft.shape} for "
-                        f"`{key}`."
-                    )
-
         # Check that all input images have the same shape.
         if len(self.image_features) > 0:
             first_image_key, first_image_ft = next(iter(self.image_features.items()))
@@ -223,6 +226,31 @@ class DiffusionConfig(PreTrainedConfig):
                 if image_ft.shape != first_image_ft.shape:
                     raise ValueError(
                         f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
+                    )
+
+            # If crop_shape is unset, compute an adaptive crop from the actual image resolution.
+            if self.crop_shape is None and self.crop_fraction is not None:
+                if not (0.0 < float(self.crop_fraction) <= 1.0):
+                    raise ValueError(f"`crop_fraction` must be in (0, 1]. Got {self.crop_fraction}.")
+                if self.crop_round_to <= 0:
+                    raise ValueError(f"`crop_round_to` must be > 0. Got {self.crop_round_to}.")
+
+                # Image feature shapes are (C, H, W).
+                _, img_h, img_w = first_image_ft.shape
+                crop_h = int((img_h * float(self.crop_fraction)) // self.crop_round_to) * self.crop_round_to
+                crop_w = int((img_w * float(self.crop_fraction)) // self.crop_round_to) * self.crop_round_to
+                crop_h = max(self.crop_round_to, min(crop_h, img_h))
+                crop_w = max(self.crop_round_to, min(crop_w, img_w))
+                self.crop_shape = (crop_h, crop_w)
+
+        # Validate crop fits within image shapes (if cropping is enabled).
+        if self.crop_shape is not None:
+            for key, image_ft in self.image_features.items():
+                if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
+                    raise ValueError(
+                        f"`crop_shape` should fit within the images shapes. Got {self.crop_shape} "
+                        f"for `crop_shape` and {image_ft.shape} for "
+                        f"`{key}`."
                     )
 
     @property

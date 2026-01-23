@@ -124,14 +124,38 @@ def load_nested_dataset(
         # When no filtering needed, Dataset uses memory-mapped loading for efficiency
         # PyArrow loads the entire dataset into memory
         if episodes is None:
-            return Dataset.from_parquet([str(path) for path in paths], features=features)
+            try:
+                return Dataset.from_parquet([str(path) for path in paths], features=features)
+            except Exception as e:  # noqa: BLE001
+                # Some datasets store numeric vectors as variable-length Arrow lists. HuggingFace `datasets`
+                # cannot always cast those to fixed-length `Sequence(length=...)` features.
+                # Fallback: retry without an explicit features schema.
+                if features is None:
+                    raise
+                logging.warning(
+                    "Failed to load parquet dataset with provided features schema (%s). "
+                    "Retrying without features. Original error: %s: %s",
+                    pq_dir,
+                    type(e).__name__,
+                    e,
+                )
+                return Dataset.from_parquet([str(path) for path in paths], features=None)
 
         arrow_dataset = pa_ds.dataset(paths, format="parquet")
         filter_expr = pa_ds.field("episode_index").isin(episodes)
         table = arrow_dataset.to_table(filter=filter_expr)
 
         if features is not None:
-            table = table.cast(features.arrow_schema)
+            try:
+                table = table.cast(features.arrow_schema)
+            except Exception as e:  # noqa: BLE001
+                logging.warning(
+                    "Failed to cast parquet table to provided features schema (%s). "
+                    "Proceeding without cast. Original error: %s: %s",
+                    pq_dir,
+                    type(e).__name__,
+                    e,
+                )
 
         return Dataset(table)
 

@@ -50,3 +50,4 @@ def get_last_item_from_queue(queue: Queue, block=True, timeout: float = 0.1) -> 
             item = queue.get_nowait()
 
     return item
+

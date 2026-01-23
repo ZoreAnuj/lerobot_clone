@@ -18,11 +18,21 @@ import argparse
 import json
 from copy import deepcopy
 from pathlib import Path
+import sys
+import shutil
 
 import cv2
+
 import torch
 import torchvision.transforms.functional as F  # type: ignore  # noqa: N812
 from tqdm import tqdm  # type: ignore
+
+# Allow running as a plain script from repo root without having to set PYTHONPATH.
+# File is: lerobot/src/lerobot/rl/crop_dataset_roi.py
+# We want to add: lerobot/src
+_src_dir = Path(__file__).resolve().parents[2]
+if _src_dir.exists() and str(_src_dir) not in sys.path:
+    sys.path.insert(0, str(_src_dir))
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import DONE, REWARD
@@ -148,11 +158,19 @@ def select_square_roi_for_images(images: dict) -> dict:
     return selected_rois
 
 
-def get_image_from_lerobot_dataset(dataset: LeRobotDataset):
+def get_image_from_lerobot_dataset(dataset: LeRobotDataset, frame_index: int | None = None):
     """
-    Find the first row in the dataset and extract the image in order to be used for the crop.
+    Extract an image from the dataset to be used for ROI selection.
+    
+    Args:
+        dataset: The LeRobotDataset to extract images from.
+        frame_index: The frame index to use. If None, uses the middle frame.
     """
-    row = dataset[0]
+    if frame_index is None:
+        frame_index = len(dataset) // 2  # Use middle frame by default
+    frame_index = max(0, min(frame_index, len(dataset) - 1))  # Clamp to valid range
+    
+    row = dataset[frame_index]
     image_dict = {}
     for k in row:
         if "image" in k:
@@ -165,7 +183,9 @@ def convert_lerobot_dataset_to_cropped_lerobot_dataset(
     crop_params_dict: dict[str, tuple[int, int, int, int]],
     new_repo_id: str,
     new_dataset_root: str,
-    resize_size: tuple[int, int] = (128, 128),
+    resize_size: tuple[int, int] = (84, 84),
+    vcodec: str = "libsvtav1",
+    resume: bool = True,
     push_to_hub: bool = False,
     task: str = "",
 ) -> LeRobotDataset:
@@ -188,14 +208,23 @@ def convert_lerobot_dataset_to_cropped_lerobot_dataset(
                         and resized.
     """
     # 1. Create a new (empty) LeRobotDataset for writing.
-    new_dataset = LeRobotDataset.create(
-        repo_id=new_repo_id,
-        fps=int(original_dataset.fps),
-        root=new_dataset_root,
-        robot_type=original_dataset.meta.robot_type,
-        features=original_dataset.meta.info["features"],
-        use_videos=len(original_dataset.meta.video_keys) > 0,
-    )
+    new_dataset_root = Path(new_dataset_root)
+
+    # Resume support: if the output dataset already exists, append new episodes starting from the first
+    # not-yet-saved episode. This is safe because LeRobotDataset.save_episode() assigns new `index` values
+    # starting at meta.total_frames and uses meta.total_episodes for the next episode index.
+    if resume and (new_dataset_root / "meta" / "info.json").exists():
+        new_dataset = LeRobotDataset(repo_id=new_repo_id, root=new_dataset_root, download_videos=False)
+    else:
+        new_dataset = LeRobotDataset.create(
+            repo_id=new_repo_id,
+            fps=int(original_dataset.fps),
+            root=new_dataset_root,
+            robot_type=original_dataset.meta.robot_type,
+            features=original_dataset.meta.info["features"],
+            use_videos=len(original_dataset.meta.video_keys) > 0,
+            vcodec=vcodec,
+        )
 
     # Update the metadata for every image key that will be cropped:
     # (Here we simply set the shape to be the final resize_size.)
@@ -203,10 +232,36 @@ def convert_lerobot_dataset_to_cropped_lerobot_dataset(
         if key in new_dataset.meta.info["features"]:
             new_dataset.meta.info["features"][key]["shape"] = [3] + list(resize_size)
 
-    # TODO:  Directly modify the mp4 video + meta info features, instead of recreating a dataset
-    prev_episode_index = 0
-    for frame_idx in tqdm(range(len(original_dataset))):
-        frame = original_dataset[frame_idx]
+    # TODO: Directly modify the mp4 video + meta info features, instead of recreating a dataset
+    num_frames = len(original_dataset)
+
+    # If resuming, skip source frames for already-saved episodes.
+    start_episode = int(getattr(new_dataset.meta, "total_episodes", 0) or 0)
+    if start_episode > 0:
+        # Best-effort cleanup of any partially written images for the episode we're about to (re)write.
+        # This matters if a previous run crashed mid-episode.
+        for k in crop_params_dict:
+            ep_dir = new_dataset.root / "images" / k / f"episode-{start_episode:06d}"
+            if ep_dir.exists():
+                shutil.rmtree(ep_dir, ignore_errors=True)
+
+        # Start from the first frame of the first not-yet-written episode.
+        try:
+            start_frame_idx = int(original_dataset.meta.episodes[start_episode]["dataset_from_index"])
+        except Exception:
+            start_frame_idx = 0
+        prev_episode_index = start_episode
+    else:
+        start_frame_idx = 0
+        prev_episode_index = 0
+
+    for frame_idx in tqdm(range(start_frame_idx, num_frames)):
+        try:
+            frame = original_dataset[frame_idx]
+        except IndexError:
+            # Handle mismatch between reported length and actual HF dataset size
+            print(f"\nWarning: Dataset length mismatch. Stopping at frame {frame_idx}/{num_frames}.")
+            break
 
         # Create a copy of the frame to add to the new dataset
         new_frame = {}
@@ -216,6 +271,16 @@ def convert_lerobot_dataset_to_cropped_lerobot_dataset(
             if key in (DONE, REWARD):
                 # if not isinstance(value, str) and len(value.shape) == 0:
                 value = value.unsqueeze(0)
+
+            # Ensure scalar tensors match LeRobot feature convention of shape (1,)
+            # (e.g. robot_id can come back as a scalar tensor depending on how parquet was written).
+            if isinstance(value, torch.Tensor) and value.dim() == 0:
+                value = value.unsqueeze(0)
+
+            # Some datasets store action/state as float64 in metadata, but decoding pipelines may yield float32.
+            # Match the dtype expected by the destination dataset features to pass validate_frame().
+            if key in ("action", "observation.state") and isinstance(value, torch.Tensor):
+                value = value.to(torch.float64)
 
             if key in crop_params_dict:
                 top, left, height, width = crop_params_dict[key]
@@ -232,11 +297,13 @@ def convert_lerobot_dataset_to_cropped_lerobot_dataset(
 
         if frame["episode_index"].item() != prev_episode_index:
             # Save the episode
-            new_dataset.save_episode()
+            # Avoid spawning extra processes per episode (can hit ulimit "Too many open files" on long runs).
+            new_dataset.save_episode(parallel_encoding=False)
             prev_episode_index = frame["episode_index"].item()
 
     # Save the last episode
-    new_dataset.save_episode()
+    new_dataset.save_episode(parallel_encoding=False)
+    new_dataset.finalize()
 
     if push_to_hub:
         new_dataset.push_to_hub()
@@ -259,10 +326,24 @@ if __name__ == "__main__":
         help="The root directory of the LeRobot dataset.",
     )
     parser.add_argument(
+        "--tolerance-s",
+        type=float,
+        default=0.05,
+        help=(
+            "Timestamp tolerance (seconds) when decoding video frames. "
+            "For ROI conversion we don't need strict timestamp matching; default 0.05s (~1-2 frames at 30Hz)."
+        ),
+    )
+    parser.add_argument(
         "--crop-params-path",
         type=str,
         default=None,
         help="The path to the JSON file containing the ROIs.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume writing into an existing output dataset (if present) instead of starting from scratch.",
     )
     parser.add_argument(
         "--push-to-hub",
@@ -281,11 +362,33 @@ if __name__ == "__main__":
         default=None,
         help="The repository id for the new cropped and resized dataset. If not provided, it defaults to `repo_id` + '_cropped_resized'.",
     )
+    parser.add_argument(
+        "--resize-size",
+        type=int,
+        nargs=2,
+        default=[84, 84],
+        metavar=("H", "W"),
+        help="Target (height, width) after ROI crop resize. Default: 84 84",
+    )
+    parser.add_argument(
+        "--vcodec",
+        type=str,
+        default="h264",
+        choices=["h264", "hevc", "libsvtav1"],
+        help="Output video codec for the cropped dataset. Default: h264 (much faster than AV1).",
+    )
+
+    parser.add_argument(
+        "--frame-index",
+        type=int,
+        default=None,
+        help="Frame index to display for ROI selection. Defaults to middle of dataset.",
+    )
     args = parser.parse_args()
 
-    dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root)
+    dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root, tolerance_s=float(args.tolerance_s))
 
-    images = get_image_from_lerobot_dataset(dataset)
+    images = get_image_from_lerobot_dataset(dataset, frame_index=args.frame_index)
     images = {k: v.cpu().permute(1, 2, 0).numpy() for k, v in images.items()}
     images = {k: (v * 255).astype("uint8") for k, v in images.items()}
 
@@ -314,7 +417,9 @@ if __name__ == "__main__":
         crop_params_dict=rois,
         new_repo_id=new_repo_id,
         new_dataset_root=new_dataset_root,
-        resize_size=(128, 128),
+        resize_size=tuple(args.resize_size),
+        vcodec=args.vcodec,
+        resume=bool(args.resume),
         push_to_hub=args.push_to_hub,
         task=args.task,
     )

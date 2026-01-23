@@ -325,12 +325,14 @@ class ACT(nn.Module):
             if config.separate_backbones_per_camera and num_cameras > 1:
                 # Create separate backbone for each camera
                 self.backbones = nn.ModuleList()
+                backbone_out_channels: int | None = None
                 for _ in range(num_cameras):
                     backbone_model = getattr(torchvision.models, config.vision_backbone)(
                         replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
                         weights=config.pretrained_backbone_weights,
                         norm_layer=FrozenBatchNorm2d,
                     )
+                    backbone_out_channels = backbone_model.fc.in_features
                     self.backbones.append(
                         IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
                     )
@@ -342,6 +344,7 @@ class ACT(nn.Module):
                     weights=config.pretrained_backbone_weights,
                     norm_layer=FrozenBatchNorm2d,
                 )
+                backbone_out_channels = backbone_model.fc.in_features
                 # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
                 # feature map).
                 # Note: The forward method of this returns a dict: {"feature_map": output}.
@@ -355,18 +358,37 @@ class ACT(nn.Module):
         # Transformer encoder input projections. The tokens will be structured like
         # [latent, (robot_state), (env_state), (image_feature_map_pixels)].
         if self.config.robot_state_feature:
-            self.encoder_robot_state_input_proj = nn.Linear(
-                self.config.robot_state_feature.shape[0], config.dim_model
-            )
+            state_dim = self.config.robot_state_feature.shape[0]
+            if config.state_mlp_hidden_dim is not None:
+                self.encoder_robot_state_input_proj = nn.Sequential(
+                    nn.Linear(state_dim, config.state_mlp_hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(config.state_mlp_hidden_dim, config.dim_model),
+                )
+            else:
+                self.encoder_robot_state_input_proj = nn.Linear(state_dim, config.dim_model)
         if self.config.env_state_feature:
             self.encoder_env_state_input_proj = nn.Linear(
                 self.config.env_state_feature.shape[0], config.dim_model
             )
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
-            self.encoder_img_feat_input_proj = nn.Conv2d(
-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
-            )
+            assert backbone_out_channels is not None
+            if config.separate_backbones_per_camera and len(self.config.image_features) > 1:
+                # Some checkpoints use per-camera input projections (ModuleList) and serialize weights as:
+                #   encoder_img_feat_input_projs.{cam_idx}.{weight,bias}
+                self.encoder_img_feat_input_projs = nn.ModuleList(
+                    [
+                        nn.Conv2d(backbone_out_channels, config.dim_model, kernel_size=1)
+                        for _ in range(len(self.config.image_features))
+                    ]
+                )
+                self.encoder_img_feat_input_proj = None
+            else:
+                self.encoder_img_feat_input_proj = nn.Conv2d(
+                    backbone_out_channels, config.dim_model, kernel_size=1
+                )
+                self.encoder_img_feat_input_projs = None
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
@@ -493,7 +515,11 @@ class ACT(nn.Module):
                 else:
                     cam_features = self.backbone(img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_img_feat_input_proj(cam_features)
+                if self.encoder_img_feat_input_projs is not None:
+                    cam_features = self.encoder_img_feat_input_projs[cam_idx](cam_features)
+                else:
+                    assert self.encoder_img_feat_input_proj is not None
+                    cam_features = self.encoder_img_feat_input_proj(cam_features)
 
                 # Rearrange features to (sequence, batch, dim).
                 cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")

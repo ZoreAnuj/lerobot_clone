@@ -196,8 +196,24 @@ class LeRobotDatasetMetadata:
                 f"Episode index {ep_index} out of range. Episodes: {len(self.episodes) if self.episodes else 0}"
             )
         ep = self.episodes[ep_index]
-        chunk_idx = ep["data/chunk_index"]
-        file_idx = ep["data/file_index"]
+        # v3 datasets typically store per-episode parquet pointers under "data/*".
+        # Some generators store them at the top-level as "chunk_index"/"file_index".
+        chunk_idx = ep.get("data/chunk_index", ep.get("chunk_index"))
+        file_idx = ep.get("data/file_index", ep.get("file_index"))
+        if chunk_idx is None or file_idx is None:
+            raise KeyError(
+                "Episode metadata missing data chunk/file indices. "
+                "Expected ('data/chunk_index','data/file_index') or ('chunk_index','file_index'). "
+                f"Available keys: {sorted(ep.keys())}"
+            )
+        # Some dataset generators store a global (absolute) file_index per episode.
+        # Convert to a per-chunk file index when needed.
+        chunk_size = int(self.info.get("chunks_size") or self._infer_chunks_size())
+        if isinstance(file_idx, (int, float)) and isinstance(chunk_idx, (int, float)):
+            file_idx_int = int(file_idx)
+            chunk_idx_int = int(chunk_idx)
+            if file_idx_int >= chunk_size:
+                file_idx = file_idx_int - chunk_idx_int * chunk_size
         fpath = self.data_path.format(chunk_index=chunk_idx, file_index=file_idx)
         return Path(fpath)
 
@@ -209,8 +225,25 @@ class LeRobotDatasetMetadata:
                 f"Episode index {ep_index} out of range. Episodes: {len(self.episodes) if self.episodes else 0}"
             )
         ep = self.episodes[ep_index]
-        chunk_idx = ep[f"videos/{vid_key}/chunk_index"]
-        file_idx = ep[f"videos/{vid_key}/file_index"]
+        # v3 datasets typically store per-camera pointers under "videos/<key>/*".
+        # Some generators omit these and assume the episode-level chunk/file applies to all cameras.
+        chunk_idx = ep.get(f"videos/{vid_key}/chunk_index", ep.get("chunk_index"))
+        file_idx = ep.get(f"videos/{vid_key}/file_index", ep.get("file_index"))
+        if chunk_idx is None or file_idx is None:
+            raise KeyError(
+                f"Episode metadata missing video chunk/file indices for {vid_key}. "
+                "Expected ('videos/<key>/chunk_index','videos/<key>/file_index') "
+                "or episode-level ('chunk_index','file_index'). "
+                f"Available keys: {sorted(ep.keys())}"
+            )
+        # Some dataset generators store a global (absolute) file_index per episode.
+        # Convert to a per-chunk file index when needed.
+        chunk_size = int(self.info.get("chunks_size") or self._infer_chunks_size())
+        if isinstance(file_idx, (int, float)) and isinstance(chunk_idx, (int, float)):
+            file_idx_int = int(file_idx)
+            chunk_idx_int = int(chunk_idx)
+            if file_idx_int >= chunk_size:
+                file_idx = file_idx_int - chunk_idx_int * chunk_size
         fpath = self.video_path.format(video_key=vid_key, chunk_index=chunk_idx, file_index=file_idx)
         return Path(fpath)
 
@@ -222,7 +255,22 @@ class LeRobotDatasetMetadata:
     @property
     def video_path(self) -> str | None:
         """Formattable string for the video files."""
-        return self.info["video_path"]
+        # Some datasets may omit this field; use the standard default.
+        return self.info.get("video_path", "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
+
+    def _infer_chunks_size(self) -> int:
+        """Best-effort inference for `chunks_size` when missing from meta/info.json.
+
+        We infer it from the episode index range in chunk 0 of meta/episodes, which is how v3 datasets
+        typically shard episodes/videos/data into chunk folders.
+        """
+        if self.episodes is None:
+            self.episodes = load_episodes(self.root)
+        chunk0 = [ep for ep in self.episodes if ep.get("chunk_index", None) == 0]
+        if not chunk0:
+            return 1000
+        ep_indices = [int(ep.get("episode_index", 0)) for ep in chunk0]
+        return max(ep_indices) - min(ep_indices) + 1
 
     @property
     def robot_type(self) -> str | None:
@@ -684,6 +732,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 encoding is CPU-heavy.
         """
         super().__init__()
+        explicit_root = root is not None
         if vcodec not in VALID_VIDEO_CODECS:
             raise ValueError(f"Invalid vcodec '{vcodec}'. Must be one of: {sorted(VALID_VIDEO_CODECS)}")
         self.repo_id = repo_id
@@ -725,7 +774,17 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.hf_dataset = self.load_hf_dataset()
             # Check if cached dataset contains all requested episodes
             if not self._check_cached_episodes_sufficient():
-                raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
+                # If the user explicitly provided a local root, do NOT try to fetch from the hub.
+                # Local datasets may have non-standard metadata layouts (e.g., episode-level video indices),
+                # but are still perfectly usable.
+                if explicit_root:
+                    logging.warning(
+                        "Dataset at %s appears to have an incomplete cache/episode index, but a local root was "
+                        "provided explicitly. Proceeding without attempting hub download.",
+                        self.root,
+                    )
+                else:
+                    raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
         except (AssertionError, FileNotFoundError, NotADirectoryError):
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
@@ -1050,8 +1109,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self._ensure_hf_dataset_loaded()
         item = self.hf_dataset[idx]
         ep_idx = item["episode_index"].item()
-        # Use the absolute index from the dataset for delta timestamp calculations
-        abs_idx = item["index"].item()
+        # Use the absolute index from the dataset for delta timestamp calculations.
+        # Some datasets don't materialize an "index" column in parquet; fall back to the row index.
+        if "index" in item:
+            abs_idx = item["index"].item()
+        else:
+            abs_idx = int(idx.item()) if hasattr(idx, "item") else int(idx)
 
         query_indices = None
         if self.delta_indices is not None:

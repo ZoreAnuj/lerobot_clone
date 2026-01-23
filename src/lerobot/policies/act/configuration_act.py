@@ -109,7 +109,7 @@ class ACTConfig(PreTrainedConfig):
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
     # Use separate backbone for each camera (recommended for multi-camera setups)
-    separate_backbones_per_camera: bool = False
+    separate_backbones_per_camera: bool = True
     # Transformer layers.
     pre_norm: bool = False
     dim_model: int = 512
@@ -125,6 +125,14 @@ class ACTConfig(PreTrainedConfig):
     use_vae: bool = True
     latent_dim: int = 32
     n_vae_encoder_layers: int = 4
+
+    # Robot state embedding.
+    # Some checkpoints were trained with an MLP embedder for the robot state token:
+    #   Linear(state_dim -> hidden) -> ReLU -> Linear(hidden -> dim_model)
+    # In those checkpoints, the state dict contains:
+    #   encoder_robot_state_input_proj.0.{weight,bias} and encoder_robot_state_input_proj.2.{weight,bias}
+    # If left unset, we fall back to the historical single Linear(state_dim -> dim_model).
+    state_mlp_hidden_dim: int | None = None
 
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.

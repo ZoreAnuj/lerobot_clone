@@ -167,6 +167,8 @@ wandb/
 data/
 dataset/
 outputs/
+session_*/
+tmp_roi_frames/
 
 # Translations
 *.mo

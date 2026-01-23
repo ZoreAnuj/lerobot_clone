@@ -255,8 +255,26 @@ def decode_video_frames_torchcodec(
     average_fps = metadata.average_fps
     # convert timestamps to frame indices
     frame_indices = [round(ts * average_fps) for ts in timestamps]
-    # retrieve frames based on indices
-    frames_batch = decoder.get_frames_at(indices=frame_indices)
+
+    # Clamp indices to valid range.
+    # Torchcodec expects 0 <= idx < num_frames; with rounding it's easy to hit exactly num_frames at the end.
+    num_frames = getattr(metadata, "num_frames", None)
+    if num_frames is not None:
+        max_idx = int(num_frames) - 1
+        frame_indices = [min(max(int(i), 0), max_idx) for i in frame_indices]
+
+    # retrieve frames based on indices (retry once with a best-effort clamp if metadata didn't expose num_frames)
+    try:
+        frames_batch = decoder.get_frames_at(indices=frame_indices)
+    except RuntimeError as e:
+        msg = str(e)
+        if "Invalid frame index" in msg and num_frames is None:
+            # Best-effort fallback: drop any negative indices and clamp everything else to the max requested-1.
+            safe_max = max(int(i) for i in frame_indices if int(i) >= 0)
+            frame_indices = [min(max(int(i), 0), safe_max) for i in frame_indices]
+            frames_batch = decoder.get_frames_at(indices=frame_indices)
+        else:
+            raise
 
     for frame, pts in zip(frames_batch.data, frames_batch.pts_seconds, strict=True):
         loaded_frames.append(frame)
